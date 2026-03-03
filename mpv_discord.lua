@@ -131,16 +131,17 @@ local function update_presence()
 
     if has_video and not is_image then
         -- media is a video
-        activity["type"] = 3 -- watching
-        activity["state"] = mp.get_property("filename")
+        activity.type = 3 -- watching
+        activity.state = mp.get_property("filename")
         local time_pos = mp.get_property_number("time-pos")
         local duration = mp.get_property_number("duration")
-        activity["timestamps"]["start_time"] = math.floor((os.time() - (time_pos or 0)) * 1000)
-        activity["timestamps"]["end_time"] = math.floor((activity["timestamps"]["start_time"] + (duration or 0)) * 1000)
-
+        activity.timestamps["start"] = math.floor((os.time() - time_pos) * 1000)
+        if duration > 0 then
+            activity.timestamps["end"] = math.floor(activity.timestamps["start"] + (duration * 1000))
+        end
     else
         -- media is a track
-        activity["type"] = 2 -- listening
+        activity.type = 2 -- listening
         local metadata = mp.get_property_native("metadata")
 
         local function getMetadata(key)
@@ -154,26 +155,28 @@ local function update_presence()
             return nil
         end
 
-        activity["state"] = mp.get_property("media-title")
+        activity.state = mp.get_property("media-title")
         if metadata then
-            activity["details"] = getMetadata("artistsort") or getMetadata("artist") or "Unknown Artist"
-            activity["assets"]["large_text"] = getMetadata("album") or "Unknown Album"
+            activity.details = getMetadata("artistsort") or getMetadata("artist") or "Unknown Artist"
+            activity.assets.large_text = getMetadata("album") or "Unknown Album"
 
             -- get urls and images from musicbrainz if mbid in metadata
             local albumid = getMetadata("musicbrainz_albumid")
             local artistid = getMetadata("musicbrainz_artistid") or getMetadata("musicbrainz_albumartistid")
             local trackid = getMetadata("musicbrainz_trackid")
 
-            activity["state_url"] = artistid and ("https://musicbrainz.org/artist/" .. artistid) or nil
-            activity["details_url"] = trackid and ("https://musicbrainz.org/recording/" .. trackid) or nil
+            activity.state_url = artistid and ("https://musicbrainz.org/artist/" .. artistid) or nil
+            activity.details_url = trackid and ("https://musicbrainz.org/recording/" .. trackid) or nil
 
             if albumid then
-                activity["assets"]["large_image"] = string.format("https://coverartarchive.org/release/%s/front", albumid)
-                activity["assets"]["large_url"] = "https://musicbrainz.org/release/" .. albumid
+                activity.assets.large_image = string.format("https://coverartarchive.org/release/%s/front", albumid)
+                activity.assets.large_url = "https://musicbrainz.org/release/" .. albumid
             end
         end
     end
 
+    if next(activity.assets) == nil then activity.assets = nil end
+    if next(activity.timestamps) == nil then activity.timestamps = nil end
 
     local is_paused = mp.get_property_native("pause")
 
