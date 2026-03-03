@@ -6,8 +6,11 @@ local ffi = require("ffi")
 local options = {
     enabled = true,
     application_id = "1031137720317263873",
+    use_local_video_filename = true -- Set to false if you have a script like https://raw.githubusercontent.com/zenwarr/mpv-config/refs/heads/master/scripts/guess-media-title.lua setting the title
 }
 opts.read_options(options, "mpv_discord")
+
+-- --- --
 
 local is_windows = mp.get_property("platform") == "windows"
 
@@ -99,7 +102,17 @@ function IPC:close()
     self.handle = nil
 end
 
-local discord_fd = nil
+local metadata = mp.get_property_native("metadata")
+local function getMetadata(key)
+    -- get metadata from table case insensitively
+    local lowerKey = string.lower(key)
+    for k, v in pairs(metadata) do
+        if string.lower(tostring(k)) == lowerKey then
+            return v
+        end
+    end
+    return nil
+end
 
 local function update_presence()
     if not options.enabled then return end
@@ -132,29 +145,14 @@ local function update_presence()
     if has_video and not is_image then
         -- media is a video
         activity.type = 3 -- watching
-        activity.state = mp.get_property("filename")
-        local time_pos = mp.get_property_number("time-pos")
-        local duration = mp.get_property_number("duration")
-        activity.timestamps["start"] = math.floor((os.time() - time_pos) * 1000)
-        if duration > 0 then
-            activity.timestamps["end"] = math.floor(activity.timestamps["start"] + (duration * 1000))
+        if options.use_local_video_filename then
+            activity.state = mp.get_property("filename")
+        else
+            activity.state = mp.get_property("media-title")
         end
     else
         -- media is a track
         activity.type = 2 -- listening
-        local metadata = mp.get_property_native("metadata")
-
-        local function getMetadata(key)
-            -- get metadata from table case insensitively
-            local lowerKey = string.lower(key)
-            for k, v in pairs(metadata) do
-                if string.lower(tostring(k)) == lowerKey then
-                    return v
-                end
-            end
-            return nil
-        end
-
         activity.state = mp.get_property("media-title")
         if metadata then
             activity.details = getMetadata("artistsort") or getMetadata("artist") or "Unknown Artist"
@@ -175,13 +173,18 @@ local function update_presence()
         end
     end
 
+    local time_pos = mp.get_property_number("time-pos")
+    local duration = mp.get_property_number("duration")
+    activity.timestamps["start"] = math.floor((os.time() - time_pos) * 1000)
+    if duration > 0 then
+        activity.timestamps["end"] = math.floor(activity.timestamps["start"] + (duration * 1000))
+    end
+
     if next(activity.assets) == nil then activity.assets = nil end
-    if next(activity.timestamps) == nil then activity.timestamps = nil end
 
-    local is_paused = mp.get_property_native("pause")
-
-    if is_paused or not activity["state"] then
-        IPC:send(1, {
+    local success
+    if mp.get_property_native("pause") or not activity["state"] then
+        success = IPC:send(1, {
             cmd = "SET_ACTIVITY",
             args = {
                 pid = utils.getpid(),
@@ -190,20 +193,28 @@ local function update_presence()
             nonce = tostring(os.time())
         })
         return
+    else
+        success = IPC:send(1, {
+            cmd = "SET_ACTIVITY",
+            args = {
+                pid = utils.getpid(),
+                activity = activity
+            },
+            nonce = tostring(os.time())
+        })
     end
 
-
-    IPC:send(1, {
-        cmd = "SET_ACTIVITY",
-        args = {
-            pid = utils.getpid(),
-            activity = activity
-        },
-        nonce = tostring(os.time())
-    })
+    if not success then
+        print("Connection to Discord lost.")
+        IPC:close()
+    end
 end
+
+mp.register_event("shutdown", function ()
+    IPC:close()
+end)
 
 mp.register_event("seek", update_presence)
 mp.observe_property("metadata", "native", update_presence)
 mp.observe_property("pause", "bool", update_presence)
-
+mp.add_periodic_timer(15, update_presence)
