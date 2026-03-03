@@ -30,6 +30,10 @@ ffi.cdef[[
     int close(int fd);
 ]]
 
+---@class sockaddr_un : ffi.cdata*
+---@field sun_family integer
+---@field sun_path   ffi.cdata*
+
 local IPC = {
     handle = nil,
 
@@ -49,21 +53,24 @@ function IPC:connect()
         end
     else
         local prefixes = { os.getenv("XDG_RUNTIME_DIR"), os.getenv("TMPDIR"), os.getenv("TMP"), "/tmp" }
+        local paths = { "", "/app/com.discordapp.Discord", "/snap.discord-canary", "/snap.discord" }
         for _, prefix in ipairs(prefixes) do
             if prefix and prefix ~= "" then
-                for i = 0, 9 do
-                    local socket_path = prefix .. "/discord-ipc-" .. i
-                    local fd = ffi.C.socket(self.AF_UNIX, self.SOCK_STREAM, 0)
-                    if fd >= 0 then
-                        local addr = ffi.new("struct sockaddr_un")
-                        addr.sun_family = self.AF_UNIX
-                        ffi.copy(addr.sun_path, socket_path)
+                for _, path in ipairs(paths) do
+                    for i = 0, 9 do
+                        local socket_path = prefix .. path .. "/discord-ipc-" .. i
+                        local fd = ffi.C.socket(self.AF_UNIX, self.SOCK_STREAM, 0)
+                        if fd >= 0 then
+                            local addr = ffi.new("struct sockaddr_un") --[[@as sockaddr_un]]
+                            addr.sun_family = self.AF_UNIX
+                            ffi.copy(addr.sun_path, socket_path)
 
-                        if ffi.C.connect(fd, addr, ffi.sizeof(addr)) == 0 then
-                            self.handle = fd
-                            return true
+                            if ffi.C.connect(fd, addr, ffi.sizeof(addr)) == 0 then
+                                self.handle = fd
+                                return true
+                            end
+                            ffi.C.close(fd)
                         end
-                        ffi.C.close(fd)
                     end
                 end
             end
@@ -115,7 +122,10 @@ local function getMetadata(key)
 end
 
 local function update_presence()
-    if not options.enabled then return end
+    if not options.enabled then
+        IPC:close()
+        return
+    end
 
     if not IPC.handle then
         if IPC:connect() then
@@ -218,3 +228,14 @@ mp.register_event("seek", update_presence)
 mp.observe_property("metadata", "native", update_presence)
 mp.observe_property("pause", "bool", update_presence)
 mp.add_periodic_timer(15, update_presence)
+
+mp.add_key_binding('Shift+D', 'discord-toggle', function()
+    options.enabled = not options.enabled
+    if options.enabled then
+        mp.osd_message("Discord RPC enabled")
+    else
+        mp.osd_message("Discord RPC disabled")
+    end
+    update_presence()
+end)
+
