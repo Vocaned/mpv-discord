@@ -9,73 +9,106 @@ local options = {
 }
 opts.read_options(options, "mpv_discord")
 
+local is_windows = mp.get_property("platform") == "windows"
+
 ffi.cdef[[
-    typedef int socklen_t;
-    typedef unsigned short sa_family_t;
-    struct sockaddr {
-        sa_family_t sa_family;
-        char sa_data[14];
-    };
+    typedef void* HANDLE;
+    HANDLE CreateFileA(const char* lpName, uint32_t dwAccess, uint32_t dwShare, void* lpSec, uint32_t dwDisp, uint32_t dwFlags, HANDLE hTempl);
+    int WriteFile(HANDLE hFile, const void* lpBuf, uint32_t nBytes, uint32_t* lpWritten, void* lpOver);
+    int CloseHandle(HANDLE hObject);
+
     struct sockaddr_un {
-        sa_family_t sun_family;
+        uint16_t sun_family;
         char sun_path[108];
     };
     int socket(int domain, int type, int protocol);
-    int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
-    ssize_t send(int sockfd, const void *buf, size_t len, int flags);
-    ssize_t recv(int sockfd, void *buf, size_t len, int flags);
+    int connect(int sockfd, const struct sockaddr_un *addr, uint32_t addrlen);
+    int write(int fd, const void *buf, size_t count);
     int close(int fd);
 ]]
 
-local AF_UNIX = 1
-local SOCK_STREAM = 1
+local IPC = {
+    handle = nil,
 
-local function connect_discord()
-    local fd = ffi.C.socket(AF_UNIX, SOCK_STREAM, 0)
-    if fd < 0 then return nil end
+    AF_UNIX = 1,
+    SOCK_STREAM = 1,
+    INVALID_HANDLE = is_windows and (ffi.cast("HANDLE", -1)) or nil,
+    GENERIC_READ_WRITE = 0xC0000000,
+    OPEN_EXISTING = 3
+}
 
-    local addr = ffi.new("struct sockaddr_un")
-    addr.sun_family = AF_UNIX
+function IPC:connect()
+    if is_windows then
+        for i = 0, 9 do
+            local pipe_path = "\\\\.\\pipe\\discord-ipc-" .. i
+            self.handle = ffi.C.CreateFileA(pipe_path, self.GENERIC_READ_WRITE, 0, nil, self.OPEN_EXISTING, 0, nil)
+            if self.handle ~= self.INVALID_HANDLE then return true end
+        end
+    else
+        local prefixes = { os.getenv("XDG_RUNTIME_DIR"), os.getenv("TMPDIR"), os.getenv("TMP"), "/tmp" }
+        for _, prefix in ipairs(prefixes) do
+            if prefix and prefix ~= "" then
+                for i = 0, 9 do
+                    local socket_path = prefix .. "/discord-ipc-" .. i
+                    local fd = ffi.C.socket(self.AF_UNIX, self.SOCK_STREAM, 0)
+                    if fd >= 0 then
+                        local addr = ffi.new("struct sockaddr_un")
+                        addr.sun_family = self.AF_UNIX
+                        ffi.copy(addr.sun_path, socket_path)
 
-    local xdg = os.getenv("XDG_RUNTIME_DIR") or "/tmp"
-    ffi.copy(addr.sun_path, xdg .. "/discord-ipc-0")
-
-    if ffi.C.connect(fd, ffi.cast("struct sockaddr *", addr), ffi.sizeof(addr)) < 0 then
-        ffi.C.close(fd)
-        return nil
+                        if ffi.C.connect(fd, addr, ffi.sizeof(addr)) == 0 then
+                            self.handle = fd
+                            return true
+                        end
+                        ffi.C.close(fd)
+                    end
+                end
+            end
+        end
     end
-
-    return fd
+    print("Could not connect to Discord socket")
+    self.handle = nil
+    return false
 end
 
-local function send_ipc(fd, op, payload)
-    local json_str = utils.format_json(payload)
+function IPC:send(op, payload)
+    if not self.handle or self.handle == self.INVALID_HANDLE then return false end
 
-    local header = ffi.new("uint32_t[2]")
-    header[0] = op
-    header[1] = string.len(json_str)
+    local json = utils.format_json(payload)
+    local header = ffi.new("uint32_t[2]", {op, #json})
 
-    ffi.C.send(fd, header, 8, 0)
-    ffi.C.send(fd, json_str, string.len(json_str), 0)
+    if is_windows then
+        local written = ffi.new("uint32_t[1]")
+        local h_ok = ffi.C.WriteFile(self.handle, header, 8, written, nil)
+        local p_ok = ffi.C.WriteFile(self.handle, json, #json, written, nil)
+        return h_ok ~= 0 and p_ok ~= 0
+    else
+        local h_bytes = ffi.C.write(self.handle, header, 8)
+        local p_bytes = ffi.C.write(self.handle, json, #json)
+        return h_bytes == 8 and p_bytes == #json
+    end
+end
+
+function IPC:close()
+    if not self.handle then return end
+    if is_windows then
+        ffi.C.CloseHandle(self.handle)
+    else
+        ffi.C.close(self.handle)
+    end
+    self.handle = nil
 end
 
 local discord_fd = nil
 
 local function update_presence()
-    if not options.enabled then
-        if discord_fd then
-            ffi.C.close(discord_fd)
-        end
-        return
-    end
+    if not options.enabled then return end
 
-
-    if not discord_fd then
-        discord_fd = connect_discord()
-        if discord_fd then
-            send_ipc(discord_fd, 0, {v = 1, client_id = options.application_id})
+    if not IPC.handle then
+        if IPC:connect() then
+            IPC:send(0, { v = 1, client_id = options.application_id })
         else
-            return -- Cannot connect to Discord
+            return
         end
     end
 
@@ -84,7 +117,8 @@ local function update_presence()
     local activity = {
         status_display_type = 1, -- state
         flags = 1,
-        assets = {}
+        assets = {},
+        timestamps = {}
     }
 
     local has_video = mp.get_property_native("current-tracks/video") ~= nil
@@ -144,7 +178,7 @@ local function update_presence()
     local is_paused = mp.get_property_native("pause")
 
     if is_paused or not activity["state"] then
-        send_ipc(discord_fd, 1, {
+        IPC:send(1, {
             cmd = "SET_ACTIVITY",
             args = {
                 pid = utils.getpid(),
@@ -156,7 +190,7 @@ local function update_presence()
     end
 
 
-    send_ipc(discord_fd, 1, {
+    IPC:send(1, {
         cmd = "SET_ACTIVITY",
         args = {
             pid = utils.getpid(),
@@ -169,3 +203,4 @@ end
 mp.register_event("seek", update_presence)
 mp.observe_property("metadata", "native", update_presence)
 mp.observe_property("pause", "bool", update_presence)
+
